@@ -17,9 +17,9 @@ func PrintMigrateFeatureInfo(sourceFeature string, targetFeature string) {
 // Do not remove this function even there is no reference to it.
 func PrintDeprecatedFeatureWarning(feature string, migrateFeature string) {
 	if len(migrateFeature) > 0 {
-		LogWarning(context.Background(), "This feature "+feature+" is deprecated and being migrated to "+migrateFeature+". Please update your config(s) according to release note and documentation before removal.")
+		// LogWarning(context.Background(), "This feature "+feature+" is deprecated and being migrated to "+migrateFeature+". Please update your config(s) according to release note and documentation before removal.")
 	} else {
-		LogWarning(context.Background(), "This feature "+feature+" is deprecated. Please update your config(s) according to release note and documentation before removal.")
+		// LogWarning(context.Background(), "This feature "+feature+" is deprecated. Please update your config(s) according to release note and documentation before removal.")
 	}
 }
 
