@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
-	C "github.com/sagernet/sing/common"
 	A "github.com/sagernet/sing/common/auth"
 	B "github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -37,10 +36,11 @@ func init() {
 }
 
 type MultiUserInbound struct {
-	sync.Mutex
+	sync.RWMutex
 	networks []net.Network
 	users    []*protocol.MemoryUser
-	service  *shadowaead_2022.MultiService[int]
+	active   map[*protocol.MemoryUser]struct{}
+	service  *shadowaead_2022.MultiService[*protocol.MemoryUser]
 }
 
 func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiUserInbound, error) {
@@ -53,6 +53,9 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 	}
 	memUsers := []*protocol.MemoryUser{}
 	for i, user := range config.Users {
+		if user == nil {
+			return nil, errors.New("missing shadowsocks user")
+		}
 		if user.Email == "" {
 			u := uuid.New()
 			user.Email = "unnamed-user-" + strconv.Itoa(i) + "-" + u.String()
@@ -66,7 +69,6 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 
 	inbound := &MultiUserInbound{
 		networks: networks,
-		users:    memUsers,
 	}
 	if config.Key == "" {
 		return nil, errors.New("missing key")
@@ -75,20 +77,55 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 	if err != nil {
 		return nil, errors.New("parse config").Base(err)
 	}
-	service, err := shadowaead_2022.NewMultiService[int](config.Method, psk, 500, inbound, nil)
+	service, err := shadowaead_2022.NewMultiService[*protocol.MemoryUser](config.Method, psk, 500, inbound, nil)
 	if err != nil {
 		return nil, errors.New("create service").Base(err)
 	}
-	err = service.UpdateUsersWithPasswords(
-		C.MapIndexed(memUsers, func(index int, it *protocol.MemoryUser) int { return index }),
-		C.Map(memUsers, func(it *protocol.MemoryUser) string { return it.Account.(*MemoryAccount).Key }),
-	)
-	if err != nil {
-		return nil, errors.New("create service").Base(err)
-	}
-
 	inbound.service = service
+	if err := inbound.updateUsersLocked(memUsers); err != nil {
+		return nil, errors.New("create service").Base(err)
+	}
 	return inbound, nil
+}
+
+// Publish credentials and membership as one transaction. Authentication uses
+// the MemoryUser itself rather than an index that removal can assign to someone
+// else. Callback admission takes the same lock and cannot observe a half update.
+// The existing service and its UDP sessions remain intact across updates.
+func (i *MultiUserInbound) updateUsersLocked(users []*protocol.MemoryUser) error {
+	passwords := make([]string, len(users))
+	active := make(map[*protocol.MemoryUser]struct{}, len(users))
+	for index, user := range users {
+		if user == nil {
+			return errors.New("missing shadowsocks user")
+		}
+		account, ok := user.Account.(*MemoryAccount)
+		if !ok || account == nil {
+			return errors.New("invalid shadowsocks account")
+		}
+		passwords[index] = account.Key
+		active[user] = struct{}{}
+	}
+	if err := i.service.UpdateUsersWithPasswords(users, passwords); err != nil {
+		return errors.New("update shadowsocks users").Base(err)
+	}
+	i.users = users
+	i.active = active
+	return nil
+}
+
+func (i *MultiUserInbound) authenticatedUser(ctx context.Context) (*protocol.MemoryUser, error) {
+	user, ok := A.UserFromContext[*protocol.MemoryUser](ctx)
+	if !ok || user == nil {
+		return nil, errors.New("missing authenticated shadowsocks user")
+	}
+	i.RLock()
+	_, active := i.active[user]
+	i.RUnlock()
+	if !active {
+		return nil, errors.New("authenticated shadowsocks user was removed")
+	}
+	return user, nil
 }
 
 // AddUser implements proxy.UserManager.AddUser().
@@ -96,23 +133,20 @@ func (i *MultiUserInbound) AddUser(ctx context.Context, u *protocol.MemoryUser) 
 	i.Lock()
 	defer i.Unlock()
 
+	if u == nil {
+		return errors.New("missing shadowsocks user")
+	}
 	if u.Email != "" {
 		for idx := range i.users {
-			if i.users[idx].Email == u.Email {
+			if strings.EqualFold(i.users[idx].Email, u.Email) {
 				return errors.New("User ", u.Email, " already exists.")
 			}
 		}
 	}
-	i.users = append(i.users, u)
-
-	// sync to multi service
-	// Considering implements shadowsocks2022 in xray-core may have better performance.
-	i.service.UpdateUsersWithPasswords(
-		C.MapIndexed(i.users, func(index int, it *protocol.MemoryUser) int { return index }),
-		C.Map(i.users, func(it *protocol.MemoryUser) string { return it.Account.(*MemoryAccount).Key }),
-	)
-
-	return nil
+	users := make([]*protocol.MemoryUser, len(i.users)+1)
+	copy(users, i.users)
+	users[len(i.users)] = u
+	return i.updateUsersLocked(users)
 }
 
 // RemoveUser implements proxy.UserManager.RemoveUser().
@@ -138,18 +172,12 @@ func (i *MultiUserInbound) RemoveUser(ctx context.Context, email string) error {
 
 	ulen := len(i.users)
 
-	i.users[idx] = i.users[ulen-1]
-	i.users[ulen-1] = nil
-	i.users = i.users[:ulen-1]
-
-	// sync to multi service
-	// Considering implements shadowsocks2022 in xray-core may have better performance.
-	i.service.UpdateUsersWithPasswords(
-		C.MapIndexed(i.users, func(index int, it *protocol.MemoryUser) int { return index }),
-		C.Map(i.users, func(it *protocol.MemoryUser) string { return it.Account.(*MemoryAccount).Key }),
-	)
-
-	return nil
+	users := make([]*protocol.MemoryUser, ulen-1)
+	copy(users, i.users[:ulen-1])
+	if idx < ulen-1 {
+		users[idx] = i.users[ulen-1]
+	}
+	return i.updateUsersLocked(users)
 }
 
 // GetUser implements proxy.UserManager.GetUser().
@@ -158,8 +186,8 @@ func (i *MultiUserInbound) GetUser(ctx context.Context, email string) *protocol.
 		return nil
 	}
 
-	i.Lock()
-	defer i.Unlock()
+	i.RLock()
+	defer i.RUnlock()
 
 	for _, u := range i.users {
 		if strings.EqualFold(u.Email, email) {
@@ -171,8 +199,8 @@ func (i *MultiUserInbound) GetUser(ctx context.Context, email string) *protocol.
 
 // GetUsers implements proxy.UserManager.GetUsers().
 func (i *MultiUserInbound) GetUsers(ctx context.Context) []*protocol.MemoryUser {
-	i.Lock()
-	defer i.Unlock()
+	i.RLock()
+	defer i.RUnlock()
 	dst := make([]*protocol.MemoryUser, len(i.users))
 	copy(dst, i.users)
 	return dst
@@ -180,8 +208,8 @@ func (i *MultiUserInbound) GetUsers(ctx context.Context) []*protocol.MemoryUser 
 
 // GetUsersCount implements proxy.UserManager.GetUsersCount().
 func (i *MultiUserInbound) GetUsersCount(context.Context) int64 {
-	i.Lock()
-	defer i.Unlock()
+	i.RLock()
+	defer i.RUnlock()
 	return int64(len(i.users))
 }
 
@@ -227,9 +255,11 @@ func (i *MultiUserInbound) Process(ctx context.Context, network net.Network, con
 }
 
 func (i *MultiUserInbound) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+	user, err := i.authenticatedUser(ctx)
+	if err != nil {
+		return err
+	}
 	inbound := session.InboundFromContext(ctx)
-	userInt, _ := A.UserFromContext[int](ctx)
-	user := i.users[userInt]
 	inbound.User = user
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   metadata.Source,
@@ -251,9 +281,11 @@ func (i *MultiUserInbound) NewConnection(ctx context.Context, conn net.Conn, met
 }
 
 func (i *MultiUserInbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	user, err := i.authenticatedUser(ctx)
+	if err != nil {
+		return err
+	}
 	inbound := session.InboundFromContext(ctx)
-	userInt, _ := A.UserFromContext[int](ctx)
-	user := i.users[userInt]
 	inbound.User = user
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   metadata.Source,
